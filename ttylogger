@@ -1,28 +1,116 @@
 #!/usr/bin/perl
+#  ttylogger
+#    Strace-based tty logger for linux.
+#    https://github.com/lemonsqueeze/ttylogger
+
 sub usage
 {  print "Usage: ttylogger pid\n";  exit(1);  }
 
 $| = 1;   # Make stdout line buffered
+#my $debug = 1;
 
 my $pid = $ARGV[0];
 (-f "/proc/$pid/status") || usage();
-my $cmd = "strace -x -e trace=write -f -p$pid -s16384";
+
+my $syscalls = "clone,write,dup,dup2,open,close";
+my $cmd = "strace -x -e trace=$syscalls -f -p$pid -s16384";
 open(IN, "$cmd 2>&1 |");
 
+# Keep track of fds in different processes
+my %process_fds;
+my %fds = (0 => 1, 1 => 1, 2 => 1);
+$process_fds{$pid} = \%fds;
+
+sub debug { if ($debug) { printf @_; } }
+
+# Find process's tty
+my $tty = "/dev/" . `ps aux | sed -e 's/  */ /g' | cut -d' ' -f2,7 | grep "^$pid" | cut -d' ' -f2`;
+chomp($tty);  debug "tty: $tty\n";
+(-c "$tty") || die "Couldn't find process's tty";
+
+sub new_process
+{
+    my ($ppid, $pid) = @_;
+    debug("$ppid: new process $pid\n");
+    my $pfds = $process_fds{$ppid};
+    my %fds = ( 0 => $$pfds{0}, 1 => $$pfds{1}, 2 => $$pfds{2} );
+    $process_fds{$pid} = \%fds;    
+}
+
+my %part_calls;
 my $n = 0;
 while (my $s = <IN>)
-{
-    if (!($s =~ m/write\([12],/))
-    {  next; }
-    $n++;
-    $s =~ s/^.*"(.*)".*$/$1/;
-    $s =~ s/\\x(..)/chr hex $1/eg;
-    $s =~ s/\\t/\t/g;
-    $s =~ s/\\r/\r/g;
-    $s =~ s/\\n/\n/g;
-    $s =~ s/\\\\/\\/g;
-    chomp($s);
-    print $s;
+{    
+    $s =~ s/^([^[].*)/[pid $pid] $1/;	# Add pid for main process
+
+    debug("                 %s", $s);
+    
+    # Stitch back together unfinished calls like:
+    #    [pid 29830] close(4 <unfinished ...>
+    #    [pid 29830] <... close resumed> )       = 0
+    if ($s =~ m/^\[pid +(\d+)\] (.*) <unfinished \.\.\.>/)
+    {	$part_calls{$1} = $2;  next; }
+
+    if ($s =~ m/^\[pid +(\d+)\] <\.\.\. \S+ resumed> (.*)/)
+    {   $s = "[pid $1] $part_calls{$1}$2";  debug("stitched back:   $s\n");  }
+
+    # Parse syscalls ...
+    if ($s =~ m/^\[pid +(\d+)\] write\((\d+),/)
+    {
+	my ($pid, $fd) = ($1, $2);
+	my %fds = %{$process_fds{$pid}};
+	if (!$fds{$fd}) {  next;  }   # No tty fd
+	$n++;
+	$s =~ s/^[^"]*"(.*)"[^"]*$/$1/;
+	$s =~ s/\\x(..)/chr hex $1/eg;
+	$s =~ s/\\t/\t/g;
+	$s =~ s/\\r/\r/g;
+	$s =~ s/\\n/\n/g;
+	$s =~ s/\\\\/\\/g;
+	print "$s";
+	STDOUT->flush();
+    }
+    
+    # clone() gets broken in unpredicatble ways ...
+    elsif ($s =~ m/^\[pid +(\d+)\].*Process (\d+) attached/)
+    {	new_process($1, $2);   }
+    
+    elsif ($s =~ m/^\[pid +(\d+)\] dup2\((\d+), *(\d+)\).*= (\d+)/)
+    {
+	my ($pid, $ofd, $nfd, $r) = ($1, $2, $3, $4);
+	debug("$pid: dup2($ofd, $nfd) = $r\n");
+	if ($r != $nfd) { next; }    
+	my $fds = $process_fds{$pid};
+	$$fds{$nfd} = $$fds{$ofd};
+    }
+
+    elsif ($s =~ m/^\[pid +(\d+)\] dup\((\d+).*= (\d+)/)
+    {
+	my ($pid, $ofd, $nfd) = ($1, $2, $3);
+	debug("$pid: dup($ofd) = $nfd\n");
+	if ($nfd == -1) { next; }    
+	my $fds = $process_fds{$pid};
+	$$fds{$nfd} = $$fds{$ofd};
+    }
+
+    elsif ($s =~ m/^\[pid +(\d+)\] close\((\d+)/)
+    {
+	my ($pid, $fd) = ($1, $2);
+	my $fds = $process_fds{$pid};
+	if ($$fds{$fd}) { debug "$pid: close($fd)\n"; }
+	$$fds{$fd} = 0;
+    }
+
+    elsif ($s =~ m/^\[pid +(\d+)\] open\("([^"]*)".* = (\d+)/)
+    {
+	my ($pid, $file, $fd) = ($1, $2, $3);
+	if ($fd == -1 || ($file ne "/dev/tty" && $file ne $tty))
+	{   next;   }
+	debug "$pid: open($file) = $r\n";
+	my $fds = $process_fds{$pid};
+	$$fds{$fd} = 1;       
+    }
+
 }
 
 # Display  error message if strace failed.

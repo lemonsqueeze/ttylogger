@@ -10,13 +10,16 @@ Use user shell's pid to trace all subsequent commands.
 
 For now only terminal output is replicated (no key logging). User input will show up if it's echo'ed to the terminal.
 
+Be aware that strace is not terribly fast at handling tons of child processes (think, very long pipes).
+[This branch](https://github.com/lemonsqueeze/ttylogger/tree/fast) is slightly faster but less accurate in keeping track of fds.
+
 ### ptrace protection
 
 If your system has ptrace protection you might need to 
 
     $ sudo ttylogger pid
 
-instead or disable ptrace protection entirely
+instead or disable ptrace protection entirely:
 
     $ sudo echo 0 > /proc/sys/kernel/yama/ptrace_scope
 
