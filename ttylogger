@@ -1,0 +1,29 @@
+#!/usr/bin/perl
+sub usage
+{  print "Usage: ttylogger pid\n";  exit(1);  }
+
+$| = 1;   # Make stdout line buffered
+
+my $pid = $ARGV[0];
+(-f "/proc/$pid/status") || usage();
+my $cmd = "strace -x -e trace=write -f -p$pid -s16384";
+open(IN, "$cmd 2>&1 |");
+
+my $n = 0;
+while (my $s = <IN>)
+{
+    if (!($s =~ m/write\([12],/))
+    {  next; }
+    $n++;
+    $s =~ s/^.*"(.*)".*$/$1/;
+    $s =~ s/\\x(..)/chr hex $1/eg;
+    $s =~ s/\\t/\t/g;
+    $s =~ s/\\r/\r/g;
+    $s =~ s/\\n/\n/g;
+    $s =~ s/\\\\/\\/g;
+    chomp($s);
+    print $s;
+}
+
+# Display  error message if strace failed.
+if ($n == 0) { system($cmd);  }
